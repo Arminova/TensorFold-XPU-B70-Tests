@@ -11,7 +11,10 @@
 #                           are not built, since building them runs a unit test that opens the card)
 #   ./run1.sh --help        this text
 #
-# Options: --work DIR (default ./tf-b70-run1)  --device N (default 0)
+# Options: --work DIR (default ./tf-b70-run1)
+#          --device N (default 0): the card, counted from 0 over the Intel GPUs in PCI order (as lspci lists them);
+#            every card step sees only that one (ZE_AFFINITY_MASK=N, ZE_ENABLE_PCI_ID_DEVICE_ORDER=1). If you set
+#            ZE_AFFINITY_MASK yourself, it is kept as it is and N counts inside it.
 #          --model DIR (a Qwen3.8-27B checkpoint you already have; enables seam, close and the speed table)
 #          --ngen DIR (oneDNN's ngen directory, the one holding ngen.hpp; or NGEN_DIR=...)
 #          --ocloc PATH (default: ocloc on PATH)  --zig PATH (default: zig on PATH)
@@ -33,7 +36,7 @@ T_BUILD="${T_BUILD:-3600}"
 T_DEVICE="${T_DEVICE:-1800}"
 T_BENCH="${T_BENCH:-1200}"
 
-usage() { sed -n '2,18p' "$0" | sed -n 's/^# \{0,1\}//p'; }
+usage() { sed -n '2,21p' "$0" | sed -n 's/^# \{0,1\}//p'; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -63,6 +66,18 @@ STEP_NAME=(); STEP_RC=(); STEP_SEC=()
 FAILED=0
 # The step commands run in a fresh bash: everything they read must be exported.
 export LOGS REPO SUMMARY DEVICE MODEL NGEN_DIR OCLOC ZIG T_BENCH
+
+# One card for every card step. The contract runner takes an ordinal, but the model binaries open the first Level Zero
+# device with the B70's PCI id, so on a two-card host only a mask pins them all to the same card.
+case "$DEVICE" in ''|*[!0-9]*) echo "--device needs a number, got '$DEVICE'" >&2; exit 2 ;; esac
+if [ -n "${ZE_AFFINITY_MASK:-}" ]; then
+  MASK_NOTE="ZE_AFFINITY_MASK=$ZE_AFFINITY_MASK set by you, kept; the contract runner gets --device $DEVICE"
+  CONTRACT_DEVICE="$DEVICE"
+else
+  export ZE_ENABLE_PCI_ID_DEVICE_ORDER=1 ZE_AFFINITY_MASK="$DEVICE"
+  MASK_NOTE="ZE_ENABLE_PCI_ID_DEVICE_ORDER=1 ZE_AFFINITY_MASK=$DEVICE: every card step sees only card $DEVICE"
+  CONTRACT_DEVICE=0
+fi
 
 say() { printf '%s\n' "$*"; }
 
@@ -95,6 +110,15 @@ step() {
 }
 
 # ---------------------------------------------------------------------------------------------- environment
+# The Intel GPUs in PCI order, numbered the way --device counts them.
+list_cards() {
+  if command -v lspci >/dev/null 2>&1; then
+    lspci -nn -d 8086: 2>/dev/null | grep -iE 'vga|display|3d' | awk '{ printf "  card %d: %s\n", n++, $0 }'
+  else
+    echo "  lspci MISSING: cannot number the cards"
+  fi
+}
+
 environment_text() {
   local ocloc_ver ze_pkg cr_pkg drv mod v
   ocloc_ver=$(dpkg-query -W -f='${Version}' intel-ocloc 2>/dev/null || echo unknown)
@@ -138,6 +162,9 @@ EOF
   else
     echo "  lspci MISSING"
   fi
+  echo "# Intel GPUs in PCI order, numbered as --device counts them"
+  list_cards
+  echo "  this run: --device $DEVICE (${MASK_NOTE})"
   echo "# Intel GPUs as the compute runtime sees them"
   if command -v clinfo >/dev/null 2>&1; then
     clinfo -l 2>/dev/null | sed 's/^/  /'
@@ -250,7 +277,7 @@ build_command() {
 }
 
 # ------------------------------------------------------------------------------------------------ card steps
-contract_cmd() { printf 'cd %q && ./zig-out/bin/tf-xpu-contract-run --device %q' "$REPO" "$DEVICE"; }
+contract_cmd() { printf 'cd %q && ./zig-out/bin/tf-xpu-contract-run --device %q' "$REPO" "$CONTRACT_DEVICE"; }
 means_cmd() { printf 'cd %q && ./zig-out/bin/tf-xpu-qwen27-means-test' "$REPO"; }
 seam_cmd() { printf 'cd %q && ./zig-out/bin/tf-xpu-qwen27-seam-test %q' "$REPO" "$MODEL"; }
 close_cmd() { printf 'cd %q && ./zig-out/bin/tf-xpu-qwen27-close-test %q' "$REPO" "$MODEL"; }
@@ -285,7 +312,7 @@ card_numbers() {
   : >"$out"
   if command -v clpeak >/dev/null 2>&1; then
     found=1
-    { echo "# clpeak"; timeout 900 clpeak -d "$DEVICE" 2>&1 || timeout 900 clpeak 2>&1; } >>"$out"
+    { echo "# clpeak"; timeout 900 clpeak 2>&1; } >>"$out"
   else
     echo "# clpeak: not installed, skipped" >>"$out"
   fi
@@ -309,7 +336,10 @@ kernel_log() {
     rm -f "$out.raw"
   fi
   [ -s "$out" ] || echo "# kernel log not readable without privileges, or no GPU lines in it: skipped" >"$out"
-  echo "# $(( $(grep -ci 'gpu hang\|reset' "$out" 2>/dev/null || echo 0) )) hang/reset lines" >>"$out"
+  # grep -c prints 0 and exits 1 when nothing matches: keep its count, never add a second one
+  local hits
+  hits=$(grep -ci 'gpu hang\|reset' "$out" 2>/dev/null)
+  echo "# ${hits:-0} hang/reset lines" >>"$out"
 }
 
 # ---------------------------------------------------------------------------------------------------- scrub
@@ -343,7 +373,7 @@ write_summary() {
     echo "generated_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "pin: $PIN (${PIN_SHA}...)"
     echo "head: $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-    echo "device_ordinal: $DEVICE"
+    echo "device_ordinal: $DEVICE ($MASK_NOTE)"
     echo "checkpoint: ${MODEL:-none given}"
     echo "no_gpu_mode: $NO_GPU"
     echo "total_seconds: $total"
@@ -361,7 +391,7 @@ write_summary() {
       echo "summary: $failed step(s) failed; each one's log is in logs/"
     fi
     [ -s "$LOGS/speed.txt" ] && { echo; echo "speed table (logs/speed.txt):"; cat "$LOGS/speed.txt"; }
-    [ -s "$LOGS/contract.log" ] && { echo; echo "contract runner:"; grep 'SUMMARY' "$LOGS/contract.log" | tail -2 | sed 's/^/  /'; }
+    [ -s "$LOGS/contract.log" ] && { echo; echo "contract runner:"; grep -a 'SUMMARY' "$LOGS/contract.log" | tail -2 | sed 's/^/  /'; }
     [ -s "$LOGS/kernel-log.txt" ] && { echo; tail -1 "$LOGS/kernel-log.txt" | sed 's/^# /kernel log: /'; }
   } >"$SUMMARY"
 }
@@ -389,7 +419,9 @@ main() {
   t0=$(date +%s)
   try_ngen_dirs
   say "TensorFold on an Intel Arc Pro B70 - first run"
-  say "pin $PIN, work folder $WORK, card ordinal $DEVICE${MODEL:+, checkpoint $MODEL}"
+  say "pin $PIN, work folder $WORK, card $DEVICE${MODEL:+, checkpoint $MODEL}"
+  say "card pinning: $MASK_NOTE"
+  list_cards
   if [ "$DRY" = 1 ]; then
     say ""
     say "plan (nothing is created, cloned, built or run):"
@@ -399,7 +431,7 @@ main() {
     if [ "$NO_GPU" = 1 ]; then
       say "  card steps    skipped (--no-gpu; the device tests are not built either)"
     else
-      say "  contract      ./zig-out/bin/tf-xpu-contract-run --device $DEVICE   (gates 1-4, planted controls, gate 5 live, timeout ${T_DEVICE}s)"
+      say "  contract      ./zig-out/bin/tf-xpu-contract-run --device $CONTRACT_DEVICE   (gates 1-4, planted controls, gate 5 live, timeout ${T_DEVICE}s)"
       say "  means         ./zig-out/bin/tf-xpu-qwen27-means-test               (group means against FP64, no model)"
       if [ -n "$MODEL" ]; then
         say "  seam          ./zig-out/bin/tf-xpu-qwen27-seam-test $MODEL          (prompt cut at 64 / 1024 / whole: same logits)"
@@ -414,13 +446,13 @@ main() {
     say "  summary       summary.txt: pass / fail and seconds per step"
     say "  pack          run1-results.tar.gz (logs/ and summary.txt), identity scrubbed, sha256 printed"
     say ""
-    say "estimated time: about $([ -n "$MODEL" ] && echo '45-60 min' || echo '25 min') (build is the bulk)"
+    say "estimated time: about $([ -n "$MODEL" ] && echo '5-15 min' || echo '2-10 min') (one 24-thread host: 6 min with the 27B; the cold build is the bulk)"
     say "the tool check would report: $(missing_tools)"
     exit 0
   fi
 
   mkdir -p "$LOGS" || exit 1
-  say "estimated time: about $([ -n "$MODEL" ] && echo '45-60 min' || echo '25 min') (build is the bulk)"
+  say "estimated time: about $([ -n "$MODEL" ] && echo '5-15 min' || echo '2-10 min') (one 24-thread host: 6 min with the 27B; the cold build is the bulk)"
   say "logs: $LOGS; nothing is uploaded"
   do_environment
 
@@ -454,9 +486,10 @@ main() {
 
   step build "$T_BUILD" "$(build_command)"
   if [ -f "$LOGS/build.log" ] && grep -q 'run test w' "$LOGS/build.log"; then
-    # Known and harmless: the runner's own host test needs a card in this build's host-test list; the binaries in
-    # zig-out/bin are still made (the build's exit status decides that, not this line). Recorded, not hidden.
-    printf '\n(note: "run test w" is the runner host test asking for a card; the build itself succeeded, see the binaries above)\n' \
+    # Known and harmless: the runner's host tests over a fake Level Zero (zig/src/xpu/runner_drain_test.zig) fail
+    # launches on purpose, and their stderr lands here, with or without a free card. The build's exit status decides
+    # whether the binaries were made, not these lines. Recorded, not hidden.
+    printf '\n(note: "run test w", "Level Zero : 0x1" and "failed command" above are stderr of the runner'"'"'s host tests, which fail launches on purpose over a fake Level Zero; they appear with a free card too. The build step'"'"'s exit status is what counts.)\n' \
       >>"$LOGS/build.log"
   fi
 

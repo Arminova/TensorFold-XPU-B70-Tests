@@ -17,7 +17,7 @@ check is one that release ships itself. The script only drives it and collects t
    written to the result file.
 2. **The build**, as the project's B70 recipe describes it: `zig build xpu-qwen27 xpu-qwen27-tests` and the
    kernel-contract runner, all for `-Dxpu-device=bmg`.
-3. **The project's own checks on one card** (`--device N`, default 0):
+3. **The project's own checks on one card** (`--device N`, default 0; see "Which card" below):
    - `tf-xpu-contract-run`: the XPU kernel contract, gates 1-4 over the registered kernels, the five planted controls,
      and gate 5 live (the card's properties and every kernel against the release's recorded limits). It prints one
      `SUMMARY` line; that line is what matters.
@@ -44,9 +44,10 @@ failure in one place never costs you the whole run.
 
 ### How long it takes
 
-About 25 minutes without a checkpoint (the build is most of it; a first build compiles six OpenCL images and ten
-generated GEMMs). About 45-60 minutes with the speed table. The script prints its estimate at the start. Each speed
-size stops after 20 minutes at most, so a size that runs badly cannot hold the machine for hours.
+Minutes, not an hour: the first report (a 24-thread desktop CPU, one B70) took 6 minutes in all with the 27B
+checkpoint, of which the cold build was 83 s and the speed table about 4 minutes. A slower CPU makes the build longer
+(a first build compiles six OpenCL images and ten generated GEMMs). Each speed size stops after 20 minutes at most, so
+a size that runs badly cannot hold the machine for hours.
 
 ### What to do
 
@@ -65,6 +66,14 @@ cd TensorFold-XPU-B70-Tests
 # on a machine with two cards, pick the one to use:
 ./run1.sh --ngen /path/to/ngen --device 1
 ```
+
+### Which card
+
+`--device N` counts the Intel GPUs from 0 in PCI order, the order `lspci -nn -d 8086:` lists them (an integrated GPU
+counts too). `--dry-run` and `logs/environment.txt` print that numbered list. Every card step then sees only card N:
+the script sets `ZE_ENABLE_PCI_ID_DEVICE_ORDER=1` and `ZE_AFFINITY_MASK=N` for them, because the model tests open the
+first B70 they find and do not take an ordinal. If you already set `ZE_AFFINITY_MASK` yourself, the script keeps it as
+it is and N counts inside it.
 
 If a tool is missing the script stops before building and prints what each one is. `--dry-run` never creates or
 builds anything.
